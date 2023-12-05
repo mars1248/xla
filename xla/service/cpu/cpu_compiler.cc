@@ -259,8 +259,7 @@ void LoadMLIRDialects(mlir::MLIRContext& context) {
 xla::cpu::HloXlaRuntimePipelineOptions GetHloXlaRuntimePipelineOptions(
     llvm::Triple target_triple, llvm::StringRef cpu_name) {
   xla::cpu::HloXlaRuntimePipelineOptions options;
-  options.enable_tiling_and_fusion =
-      xla::GetDebugOptionsFromFlags().xla_cpu_enable_mlir_tiling_and_fusion();
+  options.enable_tiling_and_fusion = false;
   if (xla::GetDebugOptionsFromFlags().xla_cpu_enable_custom_matmul_tiling()) {
     options.matmul_tile_sizes = {
         xla::GetDebugOptionsFromFlags().xla_cpu_matmul_tiling_m_dim(),
@@ -435,7 +434,7 @@ runtime::JitExecutable::Options GetXlaRuntimeJitExecutableOptions(
 
 StatusOr<std::unique_ptr<Executable>>
 CpuXlaRuntimeAotCompilationResult::LoadExecutable(
-    Compiler* compiler, se::StreamExecutor* executor) const {
+    Compiler* compiler, se::StreamExecutor* executor) {
   XlaRuntimeExecutableProto xla_runtime_executable =
       xla_runtime_cpu_executable_.xla_runtime_executable();
   TF_ASSIGN_OR_RETURN(HloModuleConfig hlo_module_config,
@@ -713,15 +712,15 @@ Status CpuCompiler::RunHloPassesThroughLayoutAssn(
   // BF16/F8 lowering for most ops.
   FloatSupport bf16_support(BF16);
   pipeline.AddPass<FloatNormalization>(&bf16_support);
-  FloatSupport f8e5m2_support(F8E5M2);
+  FloatSupport f8e5m2_support(F8E5M2, F16);
   pipeline.AddPass<FloatNormalization>(&f8e5m2_support);
-  FloatSupport f8e4m3fn_support(F8E4M3FN);
+  FloatSupport f8e4m3fn_support(F8E4M3FN, F16);
   pipeline.AddPass<FloatNormalization>(&f8e4m3fn_support);
-  FloatSupport f8e4m3b11fnuz_support(F8E4M3B11FNUZ);
+  FloatSupport f8e4m3b11fnuz_support(F8E4M3B11FNUZ, F16);
   pipeline.AddPass<FloatNormalization>(&f8e4m3b11fnuz_support);
-  FloatSupport f8e5m2fnuz_support(F8E5M2FNUZ);
+  FloatSupport f8e5m2fnuz_support(F8E5M2FNUZ, F16);
   pipeline.AddPass<FloatNormalization>(&f8e5m2fnuz_support);
-  FloatSupport f8e4m3fnuz_support(F8E4M3FNUZ);
+  FloatSupport f8e4m3fnuz_support(F8E4M3FNUZ, F16);
   pipeline.AddPass<FloatNormalization>(&f8e4m3fnuz_support);
   // After canonicalization, there may be more batch dots that can be
   // simplified.
@@ -858,6 +857,10 @@ Status CpuCompiler::RunHloPassesThroughLayoutAssn(
     pipeline.AddPass<CpuLayoutAssignment>(
         module->mutable_entry_computation_layout(), target_machine_features,
         &layout_constraints);
+    // Run SubByteNormalization because CpuLayoutAssignment may modify a
+    // Layout's element_size_in_bits field.
+    pipeline.AddPass<SubByteNormalization>(
+        SubByteNormalization::SET_ELEMENT_SIZE);
   }
 
   return pipeline.Run(module).status();

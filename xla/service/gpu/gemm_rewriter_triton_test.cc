@@ -29,7 +29,9 @@ limitations under the License.
 #include "xla/service/gpu/cublas_padding_requirements.h"
 #include "xla/service/pattern_matcher.h"
 #include "xla/service/pattern_matcher_gmock.h"
+#include "xla/statusor.h"
 #include "xla/stream_executor/device_description.h"
+#include "xla/tests/filecheck.h"
 #include "xla/tests/hlo_test_base.h"
 #include "xla/tests/verified_hlo_module.h"
 #include "xla/xla.pb.h"
@@ -59,6 +61,12 @@ class GemmRewriterTritonTest : public HloTestBase {
 
   se::GpuComputeCapability gpu_version_{
       se::CudaComputeCapability{se::CudaComputeCapability::AMPERE, 0}};
+
+  void MatchHloModule(HloModule& module, absl::string_view pattern) {
+    TF_ASSERT_OK_AND_ASSIGN(bool filecheck_result,
+                            RunFileCheck(module.ToString(), pattern));
+    EXPECT_TRUE(filecheck_result);
+  }
 };
 
 TEST_F(GemmRewriterTritonTest, TransposeSubdimensionGroup) {
@@ -752,6 +760,42 @@ ENTRY e {
             nullptr);
 }
 
+TEST_F(TritonSoftmaxAnalysisTest, BroadcastIntoBatchDimensionIsSupported) {
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                          ParseAndReturnVerifiedModule(R"(
+c {
+  p1 = f32[127]{0} parameter(0)
+  ROOT b = f32[125,127]{1,0} broadcast(p1), dimensions={1}
+}
+
+ENTRY e {
+  p0 = f32[127]{0} parameter(0)
+  ROOT t = f32[125,127]{1,0} fusion(p0), kind=kCustom, calls=c
+})"));
+  const HloComputation* computation =
+      module->entry_computation()->root_instruction()->called_computations()[0];
+  TF_ASSERT_OK_AND_ASSIGN(const auto analysis,
+                          TritonFusionAnalysis::Execute(*computation));
+  EXPECT_THAT(*analysis.IterSpec(TritonFusionAnalysis::Scope::OUTPUT,
+                                 computation->root_instruction(), 0),
+              ElementsAre(FieldsAre(/*stride=*/1, /*count=*/127,
+                                    /*slice_start=*/0, /*slice_limit=*/127,
+                                    /*subfragments=*/ElementsAre(127))));
+  EXPECT_THAT(*analysis.IterSpec(TritonFusionAnalysis::Scope::OUTPUT,
+                                 computation->root_instruction(), 1),
+              ElementsAre(FieldsAre(/*stride=*/127, /*count=*/125,
+                                    /*slice_start=*/0, /*slice_limit=*/125,
+                                    /*subfragments=*/ElementsAre(125))));
+  EXPECT_THAT(*analysis.IterSpec(TritonFusionAnalysis::Scope::OUTPUT,
+                                 computation->parameter_instruction(0), 0),
+              ElementsAre(FieldsAre(/*stride=*/1, /*count=*/127,
+                                    /*slice_start=*/0, /*slice_limit=*/127,
+                                    /*subfragments=*/ElementsAre(127))));
+  EXPECT_EQ(analysis.IterSpec(TritonFusionAnalysis::Scope::OUTPUT,
+                              computation->parameter_instruction(0), 1),
+            nullptr);
+}
+
 TEST_F(GemmRewriterTritonTest, HandleDotIfCublasRequiresPadding) {
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
                           ParseAndReturnVerifiedModule(R"(
@@ -839,7 +883,15 @@ ENTRY e {
 }
 )"));
   const se::CudaComputeCapability cc{se::CudaComputeCapability::AMPERE, 0};
-  EXPECT_FALSE(GemmRewriterTriton(cc).Run(module.get()).value());
+
+  ASSERT_TRUE(GemmRewriterTriton(cc).Run(module.get()).value());
+
+  // Slice is not fused.
+  MatchHloModule(*module, R"(
+; CHECK-NOT: slice
+; CHECK: ENTRY
+; CHECK: slice
+)");
 }
 
 TEST_F(GemmRewriterTritonTest, MultipleUsesAreHandled) {
@@ -1069,7 +1121,100 @@ ENTRY e {
   EXPECT_EQ(module->entry_computation()->root_instruction()->fusion_kind(),
             HloInstruction::FusionKind::kCustom);
   EXPECT_LE(module->entry_computation()->root_instruction()->operand_count(),
-            TritonFusionAnalysis::kMaxParameterPerScope * 2);
+            TritonFusionAnalysis::kMaxParameterPerDotScope * 2);
+}
+
+TEST_F(GemmRewriterTritonLevel2Test,
+       DoNotFuseTooManyParametersWhenAnInstructionWouldAddMultipleParameters) {
+  static_assert(TritonFusionAnalysis::kMaxParameterPerDotScope == 4,
+                "We have to update this test.");
+  // If we fuse the select, it adds 2 additional parameters at once (not 3,
+  // because the select instruction itself is removed from the parameters).
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                          ParseAndReturnVerifiedModule(R"(
+ENTRY e {
+  a = f32[3,49]{1,0} parameter(0)
+  b = f32[3,49]{1,0} parameter(1)
+  c = pred[3,49]{1,0} parameter(2)
+  d = f32[3,49]{1,0} parameter(3)
+  e = f32[3,49]{1,0} parameter(4)
+  add0 = f32[3,49]{1,0} add(a, b)
+  select = f32[3,49]{1,0} select(c, d, e)
+  add1 = f32[3,49]{1,0} add(add0, select)
+  f = f32[3,32]{1,0} parameter(5)
+  ROOT tmp_102 = f32[49,32]{1,0} dot(add1, f), lhs_contracting_dims={0}, rhs_contracting_dims={0}
+})"));
+
+  EXPECT_TRUE(GemmRewriterTriton(gpu_version_).Run(module.get()).value());
+  EXPECT_EQ(module->entry_computation()->root_instruction()->opcode(),
+            HloOpcode::kFusion);
+  EXPECT_EQ(module->entry_computation()->root_instruction()->fusion_kind(),
+            HloInstruction::FusionKind::kCustom);
+  EXPECT_LE(module->entry_computation()->root_instruction()->operand_count(),
+            TritonFusionAnalysis::kMaxParameterPerDotScope + 1);
+}
+
+TEST_F(GemmRewriterTritonLevel2Test,
+       InstructionsReachableFromMultipleOperandsAreHandledCorrectly) {
+  static_assert(TritonFusionAnalysis::kMaxParameterPerDotScope == 4,
+                "We have to update this test.");
+  // There was a bug that some dead code was generated into some fusions in a
+  // specific edge case. When some instructions were reachable both through the
+  // LHS and the RHS operands, the BFS (Breadth-first search) through the LHS1
+  // operand "marked" one operation as non-fusible because it would exceed the
+  // limit on fusion parameters per operand. But the BFS through the RHS operand
+  // went through that node and fused some more operands. So the resulting
+  // fusion was not connected and caused errors. This test case checks that such
+  // configurations generate a correct HLO now.
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                          ParseAndReturnVerifiedModule(R"(
+ENTRY e {
+  a = f32[2,4]{1,0} parameter(0)
+  b = f32[2,4]{1,0} parameter(1)
+  c = f32[2,4]{1,0} parameter(2)
+  d = f32[2,4]{1,0} parameter(3)
+  e = f32[2,4]{1,0} parameter(4)
+  add0 = f32[2,4]{1,0} add(a, b)
+  add1 = f32[2,4]{1,0} add(add0, c)
+  add2 = f32[2,4]{1,0} add(add1, d)
+  add3 = f32[2,4]{1,0} add(add2, e)
+  ROOT r = f32[2,2]{1,0} dot(add3, add0),
+           lhs_contracting_dims={1}, rhs_contracting_dims={1}
+})"));
+
+  EXPECT_TRUE(GemmRewriterTriton(gpu_version_).Run(module.get()).value());
+  // ~VerifiedHloModule() will verify the module.
+}
+
+TEST_F(GemmRewriterTritonLevel2Test, EachScopeIsFusedToASeparateSubgraph) {
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                          ParseAndReturnVerifiedModule(R"(
+ENTRY e {
+  a = f32[2,4]{1,0} parameter(0)
+  b = f32[2,4]{1,0} parameter(1)
+  add = f32[2,4]{1,0} add(a, b)
+  ROOT r = f32[2,2]{1,0} dot(add, add),
+           lhs_contracting_dims={1}, rhs_contracting_dims={1}
+})"));
+
+  EXPECT_TRUE(GemmRewriterTriton(gpu_version_).Run(module.get()).value());
+
+  MatchHloModule(*module, R"(
+CHECK-DAG: %[[P0:.*]] = f32[2,4]{1,0} parameter(0)
+CHECK-DAG: %[[P1:.*]] = f32[2,4]{1,0} parameter(1)
+CHECK-DAG: %[[ADD0:.*]] = f32[2,4]{1,0} add(f32[2,4]{1,0} %[[P0]], f32[2,4]{1,0} %[[P1]])
+CHECK-DAG: %[[P2:.*]] = f32[2,4]{1,0} parameter(2)
+CHECK-DAG: %[[P3:.*]] = f32[2,4]{1,0} parameter(3)
+CHECK-DAG: %[[ADD1:.*]] = f32[2,4]{1,0} add(f32[2,4]{1,0} %[[P2]], f32[2,4]{1,0} %[[P3]])
+CHECK-DAG: ROOT {{.*}} = f32[2,2]{1,0} dot(f32[2,4]{1,0} %[[ADD0]], f32[2,4]{1,0} %[[ADD1]])
+CHECK: ENTRY
+CHECK-DAG: %[[P0:.*]] = f32[2,4]{1,0} parameter(0)
+CHECK-DAG: %[[P1:.*]] = f32[2,4]{1,0} parameter(1)
+CHECK-DAG: ROOT {{.*}} = f32[2,2]{1,0}
+CHECK-SAME: fusion(f32[2,4]{1,0} %[[P0]], f32[2,4]{1,0} %[[P1]], f32[2,4]{1,0} %[[P0]], f32[2,4]{1,0} %[[P1]]),
+CHECK-SAME: kind=kCustom
+CHECK-SAME: __triton_gemm
+})");
 }
 
 TEST_F(GemmRewriterTritonLevel2Test,
@@ -1226,6 +1371,41 @@ ENTRY e {
   EXPECT_THAT(module->entry_computation()->root_instruction(),
               GmockMatch((m::Add(m::Fusion(m::Parameter(), m::Parameter()),
                                  m::Negate()))));
+}
+
+TEST_F(GemmRewriterTritonLevel2Test, NestedSlicingIsAnalyzedCorrectly) {
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                          ParseAndReturnVerifiedModule(R"(
+triton_gemm_d_computation {
+  p0 = f32[6,24]{1,0} parameter(0)
+  s1 = f32[5,20]{1,0} slice(p0), slice={[1:6], [3:23]}
+  n1 = f32[5,20]{1,0} negate(s1)
+  s2 = f32[3,7]{1,0} slice(n1), slice={[1:4], [13:20]}
+  p1 = f32[7,37]{1,0} parameter(1)
+  ROOT d = f32[3,37]{1,0} dot(s2, p1),
+    lhs_contracting_dims={1}, rhs_contracting_dims={0}
+}
+
+ENTRY e {
+  p0 = f32[7,37]{1,0} parameter(0)
+  p1 = f32[6,24]{1,0} parameter(1)
+  ROOT triton_gemm_d = f32[3,37]{1,0} fusion(p1, p0), kind=kCustom,
+    calls=triton_gemm_d_computation
+})"));
+  const HloComputation* computation =
+      module->entry_computation()->root_instruction()->called_computations()[0];
+  TF_ASSERT_OK_AND_ASSIGN(const auto analysis,
+                          TritonFusionAnalysis::Execute(*computation));
+  EXPECT_THAT(*analysis.IterSpec(TritonFusionAnalysis::Scope::LHS,
+                                 computation->parameter_instruction(0), 0),
+              ElementsAre(FieldsAre(/*stride=*/24, /*count=*/6,
+                                    /*slice_start=*/2, /*slice_limit=*/5,
+                                    /*subfragments=*/ElementsAre(3))));
+  EXPECT_THAT(*analysis.IterSpec(TritonFusionAnalysis::Scope::LHS,
+                                 computation->parameter_instruction(0), 1),
+              ElementsAre(FieldsAre(/*stride=*/1, /*count=*/24,
+                                    /*slice_start=*/16, /*slice_limit=*/23,
+                                    /*subfragments=*/ElementsAre(7))));
 }
 
 }  // namespace

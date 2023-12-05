@@ -23,6 +23,7 @@ limitations under the License.
 #include "absl/base/optimization.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_replace.h"
+#include "absl/strings/string_view.h"
 #include "absl/strings/substitute.h"
 #include "xla/comparison_util.h"
 #include "xla/error_spec.h"
@@ -210,13 +211,14 @@ ENTRY e {
   p1 = $0[33,68]{1,0} parameter(1)
   p0 = f32[15,33]{1,0} parameter(0)
   fusion = f32[33,68]{1,0} fusion(p1), kind=kLoop, calls=fused_computation
-  ROOT custom-call = f32[15,68]{1,0} custom-call(p0, fusion),
+  gemm = (f32[15,68]{1,0}, s8[0]{0}) custom-call(p0, fusion),
     custom_call_target="__cublas$$gemm",
     backend_config={"alpha_real":1,"beta":0,"dot_dimension_numbers":
       {"lhs_contracting_dimensions":["1"],"rhs_contracting_dimensions":["0"],
       "lhs_batch_dimensions":[],"rhs_batch_dimensions":[]},
       "alpha_imag":0,"precision_config":
       {"operand_precision":["HIGHEST","HIGHEST"]},"epilogue":"DEFAULT"}
+   ROOT get-tuple-element = f32[15,68]{1,0} get-tuple-element((f32[15,68]{1,0}, s8[0]{0}) gemm), index=0
 })";
   const std::string hlo_ref = absl::Substitute(
       kHloRefTemplate, primitive_util::LowercasePrimitiveTypeName(data_type),
@@ -322,13 +324,14 @@ ENTRY e {
   p1 = $0[11,63]{1,0} parameter(1)
   p0 = f32[92,11]{1,0} parameter(0)
   fusion = f32[11,63]{1,0} fusion(p1, p2), kind=kLoop, calls=fused_computation
-  ROOT custom-call = f32[92,63]{1,0} custom-call(p0, fusion),
+  gemm = (f32[92,63]{1,0}, s8[0]{0}) custom-call(p0, fusion),
     custom_call_target="__cublas$$gemm",
     backend_config={"alpha_real":1,"beta":0,"dot_dimension_numbers":
       {"lhs_contracting_dimensions":["1"],"rhs_contracting_dimensions":["0"],
       "lhs_batch_dimensions":[],"rhs_batch_dimensions":[]},
       "alpha_imag":0,"precision_config":
       {"operand_precision":["HIGHEST","HIGHEST"]},"epilogue":"DEFAULT"}
+  ROOT get-tuple-element = f32[92,63]{1,0} get-tuple-element((f32[92,63]{1,0}, s8[0]{0}) gemm), index=0
 })";
   const std::string hlo_ref = absl::Substitute(
       kHloRefTemplate, primitive_util::LowercasePrimitiveTypeName(data_type),
@@ -448,13 +451,14 @@ ENTRY e {
   p1 = $0[11,63]{1,0} parameter(1)
   p0 = f32[92,11]{1,0} parameter(0)
   fusion = f32[11,63]{1,0} fusion(p1, p2), kind=kLoop, calls=fused_computation
-  ROOT custom-call = f32[92,63]{1,0} custom-call(p0, fusion),
+  gemm = (f32[92,63]{1,0}, s8[0]{0}) custom-call(p0, fusion),
     custom_call_target="__cublas$$gemm",
     backend_config={"alpha_real":1,"beta":0,"dot_dimension_numbers":
       {"lhs_contracting_dimensions":["1"],"rhs_contracting_dimensions":["0"],
       "lhs_batch_dimensions":[],"rhs_batch_dimensions":[]},
       "alpha_imag":0,"precision_config":
       {"operand_precision":["HIGHEST","HIGHEST"]},"epilogue":"DEFAULT"}
+  ROOT get-tuple-element = f32[92,63]{1,0} get-tuple-element((f32[92,63]{1,0}, s8[0]{0}) gemm), index=0
 })";
   const std::string hlo_ref = absl::Substitute(
       kHloRefTemplate, primitive_util::LowercasePrimitiveTypeName(data_type),
@@ -555,13 +559,14 @@ ENTRY e {
   p0 = $1[92,11]{1,0} parameter(0)
   fusion = $1[11,63]{1,0} fusion(p1, p2, p3), kind=kLoop,
     calls=fused_computation
-  ROOT custom-call = $1[92,63]{1,0} custom-call(p0, fusion),
+  gemm = ($1[92,63]{1,0}, s8[0]{0}) custom-call(p0, fusion),
     custom_call_target="__cublas$$gemm",
     backend_config={"alpha_real":1,"beta":0,"dot_dimension_numbers":
       {"lhs_contracting_dimensions":["1"],"rhs_contracting_dimensions":["0"],
       "lhs_batch_dimensions":[],"rhs_batch_dimensions":[]},
       "alpha_imag":0,"precision_config":
       {"operand_precision":["HIGHEST","HIGHEST"]},"epilogue":"DEFAULT"}
+  ROOT get-tuple-element = $1[92,63]{1,0} get-tuple-element(($1[92,63]{1,0}, s8[0]{0}) gemm), index=0
 })";
   const std::string hlo_ref = absl::Substitute(
       kHloRefTemplate, primitive_util::LowercasePrimitiveTypeName(data_type1),
@@ -668,13 +673,14 @@ ENTRY e {
   p0 = f32[92,11]{1,0} parameter(0)
   fusion = f32[11,63]{1,0} fusion(p1), kind=kLoop,
     calls=fused_computation
-  ROOT custom-call = f32[92,63]{1,0} custom-call(p0, fusion),
+  gemm = (f32[92,63]{1,0}, s8[0]{0}) custom-call(p0, fusion),
     custom_call_target="__cublas$$gemm",
     backend_config={"alpha_real":1,"beta":0,"dot_dimension_numbers":
       {"lhs_contracting_dimensions":["1"],"rhs_contracting_dimensions":["0"],
       "lhs_batch_dimensions":[],"rhs_batch_dimensions":[]},
       "alpha_imag":0,"precision_config":
       {"operand_precision":["HIGHEST","HIGHEST"]},"epilogue":"DEFAULT"}
+  ROOT get-tuple-element = f32[92,63]{1, 0} get-tuple-element((f32[92,63]{1, 0}, s8[0]{0}) gemm), index=0
 })";
   const std::string hlo_ref = absl::Substitute(
       kHloRefTemplate, primitive_util::LowercasePrimitiveTypeName(data_type));
@@ -909,6 +915,49 @@ ENTRY main {
   }
   EXPECT_TRUE(RunAndCompare(hlo_text,
                             ErrorSpec(/*aabs=*/tolerance, /*arel=*/tolerance)));
+}
+
+TEST_P(TritonSoftmaxTest, CanFuseAndEmitSoftmaxDiamondWithSmallRows) {
+  PrimitiveType data_type = GetParam();
+  if (data_type == BF16 && !GetCudaComputeCapability().IsAtLeast(
+                               se::CudaComputeCapability::AMPERE)) {
+    GTEST_SKIP() << R"(No BF16 before Ampere. Pre-Ampere BF16 behavior is tested
+    in CanFuseAndEmitFirstSoftmaxDiamond, and in SoftmaxRewriterTritonTest.)";
+  }
+
+  constexpr absl::string_view kHloTextTemplate = R"(
+HloModule softmax
+min_computation {
+  arg_0 = $0[] parameter(0)
+  arg_1 = $0[] parameter(1)
+  ROOT minimum = $0[] minimum(arg_0, arg_1)
+}
+ENTRY main {
+  param_0 = $0[127,7]{1,0} parameter(0)
+  constant_neg_inf = $0[] constant(-inf)
+  reduce = $0[127]{0} reduce(param_0, constant_neg_inf), dimensions={1}, to_apply=min_computation
+  broadcast = $0[127,7]{1,0} broadcast(reduce), dimensions={0}
+  ROOT subtract = $0[127,7]{1,0} subtract(param_0, broadcast)
+}
+)";
+
+  const std::string hlo_text = absl::Substitute(
+      kHloTextTemplate, primitive_util::LowercasePrimitiveTypeName(data_type));
+
+  constexpr absl::string_view kHloRefTemplate = R"(
+; CHECK:    ENTRY
+; CHECK:      %[[param_0:.*]] = $0[127,7]{1,0} parameter(0)
+; CHECK:      ROOT
+; CHECK-SAME: fusion(%[[param_0]])
+; CHECK-SAME:   kind=kCustom
+; CHECK-SAME:   __triton_softmax
+)";
+
+  const std::string hlo_ref = absl::Substitute(
+      kHloRefTemplate, primitive_util::LowercasePrimitiveTypeName(data_type));
+
+  MatchOptimizedHlo(hlo_text, hlo_ref);
+  EXPECT_TRUE(RunAndCompare(hlo_text, ErrorSpec(/*aabs=*/0, /*arel=*/0)));
 }
 
 TEST_F(TritonSoftmaxTest, CanFuseAndEmitDiamondWithBF16Converts) {

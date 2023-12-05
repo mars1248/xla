@@ -17,12 +17,14 @@ limitations under the License.
 #define XLA_STREAM_EXECUTOR_COMMAND_BUFFER_H_
 
 #include <cstdint>
+#include <functional>
 #include <memory>
-#include <tuple>
 
 #include "absl/functional/any_invocable.h"
+#include "xla/stream_executor/device_memory.h"
 #include "xla/stream_executor/kernel.h"
 #include "xla/stream_executor/launch_dim.h"
+#include "xla/stream_executor/platform.h"
 #include "tsl/platform/errors.h"
 #include "tsl/platform/status.h"
 #include "tsl/platform/statusor.h"
@@ -48,6 +50,9 @@ class CommandBufferInterface;
 // device.
 class CommandBuffer {
  public:
+  // Builder constructs nested command buffers owned by a parent command buffer.
+  using Builder = std::function<tsl::Status(CommandBuffer*)>;
+
   ~CommandBuffer();
   CommandBuffer(CommandBuffer&&);
   CommandBuffer& operator=(CommandBuffer&&);
@@ -95,12 +100,20 @@ class CommandBuffer {
       Mode mode = Mode::kPrimary);
 
   //===--------------------------------------------------------------------===//
+  // Command buffer properties
+  //===--------------------------------------------------------------------===//
+
+  // Returns true if command buffer on a given platform supports conditional
+  // commands (If, IfThen, While).
+  static bool SupportsConditionalCommands(const Platform* platform);
+
+  //===--------------------------------------------------------------------===//
   // Command buffer API
   //===--------------------------------------------------------------------===//
 
   // Adds a kernel launch command to the command buffer.
   tsl::Status Launch(const ThreadDim& threads, const BlockDim& blocks,
-                     const KernelBase& kernel, const KernelArgsArrayBase& args);
+                     const Kernel& kernel, const KernelArgs& args);
 
   // Adds a nested command buffer to the command buffer.
   tsl::Status AddNestedCommandBuffer(const CommandBuffer& nested);
@@ -108,6 +121,23 @@ class CommandBuffer {
   // Adds a device-to-device memory copy to the command buffer.
   tsl::Status MemcpyDeviceToDevice(DeviceMemoryBase* dst,
                                    const DeviceMemoryBase& src, uint64_t size);
+
+  //--------------------------------------------------------------------------//
+  // Command buffer condtitional commands API
+  //--------------------------------------------------------------------------//
+
+  // Adds a conditional operation that will run a command buffer constructed by
+  // `then_builder` if `predicate` value is `true`.
+  tsl::Status If(StreamExecutor* executor, DeviceMemory<bool> pred,
+                 Builder then_builder);
+
+  // Adds a conditional operation that will run a command buffer constructed by
+  // `then_builder` if `predicate` value is `true`, or a command buffer
+  // constructed by `else_builder` if `predicate` is `false`.
+  tsl::Status IfElse(StreamExecutor* executor, DeviceMemory<bool> pred,
+                     Builder then_builder, Builder else_builder);
+
+  //--------------------------------------------------------------------------//
 
   // Finalizes command buffer and makes it executable. Once command buffer is
   // finalized no commands can be added to it.
@@ -130,22 +160,24 @@ class CommandBuffer {
   // Returns command buffer state.
   State state() const;
 
-  internal::CommandBufferInterface* implementation() {
-    return implementation_.get();
-  }
+  //===--------------------------------------------------------------------===//
+  // Semi-internal APIs
+  //===--------------------------------------------------------------------===//
 
-  StreamExecutor* executor() const { return executor_; }
+  // Following APIs are public, but considered to be implementation detail and
+  // discouraged from uses outside of StreamExecutor package.
+  const internal::CommandBufferInterface* implementation() const;
+  internal::CommandBufferInterface* implementation();
 
-  const internal::CommandBufferInterface* implementation() const {
-    return implementation_.get();
-  }
-
- private:
-  CommandBuffer(
-      StreamExecutor* executor,
+  // Wraps platform-specific command buffer implementation into a top-level
+  // StreamExecutor command buffer.
+  static CommandBuffer Wrap(
       std::unique_ptr<internal::CommandBufferInterface> implementation);
 
-  StreamExecutor* executor_;
+ private:
+  explicit CommandBuffer(
+      std::unique_ptr<internal::CommandBufferInterface> implementation);
+
   std::unique_ptr<internal::CommandBufferInterface> implementation_;
 
   CommandBuffer(const CommandBuffer&) = delete;
@@ -160,12 +192,8 @@ template <typename... Params, typename... Args>
 inline tsl::Status CommandBuffer::Launch(const TypedKernel<Params...>& kernel,
                                          const ThreadDim& threads,
                                          const BlockDim& blocks, Args... args) {
-  KernelInvocationChecker<std::tuple<Params...>,
-                          std::tuple<Args...>>::CheckAllStaticAssert();
-
-  KernelArgsArray<sizeof...(args)> kernel_args;
-  kernel.PackParams(&kernel_args, args...);
-  TF_RETURN_IF_ERROR(Launch(threads, blocks, kernel, kernel_args));
+  auto kernel_args = PackKernelArgs(kernel, args...);
+  TF_RETURN_IF_ERROR(Launch(threads, blocks, kernel, *kernel_args));
   return tsl::OkStatus();
 }
 

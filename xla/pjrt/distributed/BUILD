@@ -1,7 +1,7 @@
-load("@tsl//tsl/platform:rules_cc.bzl", "cc_library")
-load("@tsl//tsl/platform:build_config.bzl", "tf_proto_library")
-load("@tsl//tsl:tsl.default.bzl", "tsl_grpc_cc_dependencies")
 load("//xla:xla.bzl", "xla_cc_test")
+load("@tsl//tsl:tsl.default.bzl", "tsl_grpc_cc_dependencies")
+load("@tsl//tsl/platform:build_config.bzl", "tf_proto_library")
+load("@tsl//tsl/platform:rules_cc.bzl", "cc_library")
 
 licenses(["notice"])
 
@@ -13,27 +13,7 @@ package(
 tf_proto_library(
     name = "protocol_proto",
     srcs = ["protocol.proto"],
-    has_services = 1,
     cc_api_version = 2,
-    create_grpc_library = True,
-    use_grpc_namespace = True,
-)
-
-cc_library(
-    name = "protocol",
-    hdrs = ["protocol.h"],
-)
-
-cc_library(
-    name = "key_value_store",
-    srcs = ["key_value_store.cc"],
-    hdrs = ["key_value_store.h"],
-    deps = [
-        "@com_google_absl//absl/base:core_headers",
-        "@com_google_absl//absl/container:flat_hash_map",
-        "@com_google_absl//absl/synchronization",
-        "@com_google_absl//absl/time",
-    ] + tsl_grpc_cc_dependencies(),
 )
 
 cc_library(
@@ -41,9 +21,6 @@ cc_library(
     srcs = ["service.cc"],
     hdrs = ["service.h"],
     deps = [
-        ":key_value_store",
-        ":protocol",
-        ":protocol_cc_grpc_proto",
         ":topology_util",
         ":util",
         "//xla:status",
@@ -72,7 +49,14 @@ xla_cc_test(
     deps = [
         ":protocol_proto_cc",
         ":topology_util",
+        "//xla:status",
+        "//xla:statusor",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
         "@tsl//tsl/lib/core:status_test_util",
+        "@tsl//tsl/platform:env",
         "@tsl//tsl/platform:test",
         "@tsl//tsl/platform:test_main",
     ],
@@ -87,8 +71,6 @@ cc_library(
         "client.h",
     ],
     deps = [
-        ":protocol",
-        ":protocol_cc_grpc_proto",
         ":util",
         "//xla:statusor",
         "//xla:types",
@@ -133,9 +115,21 @@ cc_library(
     hdrs = ["topology_util.h"],
     deps = [
         ":protocol_proto_cc",
+        "//xla:status",
+        "//xla:statusor",
+        "//xla:util",
+        "//xla/pjrt:pjrt_client",
+        "//xla/pjrt:utils",
         "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
+        "@tsl//tsl/platform:env",
+        "@tsl//tsl/platform:errors",
         "@tsl//tsl/platform:logging",
+        "@tsl//tsl/platform:statusor",
     ],
 )
 
@@ -148,6 +142,7 @@ xla_cc_test(
         ":distributed",
         ":protocol_proto_cc",
         ":service",
+        ":topology_util",
         "//xla:protobuf_util",
         "//xla:status_macros",
         "@com_google_absl//absl/strings",

@@ -68,6 +68,18 @@ struct CudaComputeCapability {
     return !(*this < CudaComputeCapability{other_major, other_minor});
   }
 
+  bool IsAtLeastVolta() const {
+    return major >= CudaComputeCapabilities::VOLTA;
+  }
+
+  bool IsAtLeastAmpere() const {
+    return major >= CudaComputeCapabilities::AMPERE;
+  }
+
+  bool IsAtLeastHopper() const {
+    return major >= CudaComputeCapabilities::HOPPER;
+  }
+
   bool operator<(const CudaComputeCapability &other) const {
     return ToPair() < other.ToPair();
   }
@@ -188,11 +200,12 @@ class RocmComputeCapability {
   std::string gcn_arch_name_ = "gfx000";  // default to invalid arch.
 
   static constexpr absl::string_view kSupportedGfxVersions[]{
-      "gfx900",  // MI25
-      "gfx906",  // MI50 / MI60
-      "gfx908",  // MI100
-      "gfx90a",  // MI200
-      "gfx1030"  // Navi21
+      "gfx900",   // MI25
+      "gfx906",   // MI50 / MI60
+      "gfx908",   // MI100
+      "gfx90a",   // MI200
+      "gfx1030",  // Navi21
+      "gfx1100"   // Navi31
   };
 };
 
@@ -349,9 +362,9 @@ class DeviceDescription {
   static const char *kUndefinedString;
 
  private:
-  friend class internal::DeviceDescriptionBuilder;
-
   DeviceDescription();
+
+  friend class internal::DeviceDescriptionBuilder;
 
   // For description of the following members, see the corresponding accessor
   // above.

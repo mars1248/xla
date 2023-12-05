@@ -61,6 +61,7 @@ limitations under the License.
 #include "xla/xla_data.pb.h"
 #include "tsl/platform/errors.h"
 #include "tsl/platform/statusor.h"
+#include "tsl/platform/tensor_float_32_utils.h"
 
 namespace xla {
 namespace gpu {
@@ -316,6 +317,8 @@ bool DimensionOrder::IsPhysicallyEquivalent(const DimensionOrder& other) const {
 enum class TransformDirection { kInputToOutput, kOutputToInput };
 
 using DimOrderUpdatesOrError = std::variant<FusionDecision, DimOrderUpdates>;
+using OldToNewHloMap =
+    absl::flat_hash_map<const HloInstruction*, HloInstruction*>;
 
 class FusionContext {
   struct DotProperties {
@@ -380,8 +383,7 @@ class FusionContext {
   // description(s) of its other side if it is supported.
   DimOrderUpdatesOrError AnalyzeForFusion(
       const HloInstruction& hlo, TransformDirection transform_direction,
-      absl::flat_hash_map<const HloInstruction*, HloInstruction*>&
-          old_to_new_mapping,
+      OldToNewHloMap& old_to_new_map,
       se::GpuComputeCapability gpu_version) const;
   // Add dimension orders from `updates` to `dim_orders_` and update the
   // splittable dimension ratio if all of them are compatible.
@@ -391,8 +393,7 @@ class FusionContext {
   // fusion, otherwise put it onto stack and check its own inputs first.
   void TryToFuseWithInputsRecursively(
       HloInstruction& root, se::GpuComputeCapability gpu_version,
-      absl::flat_hash_map<const HloInstruction*, HloInstruction*>&
-          old_to_new_mapping,
+      OldToNewHloMap& old_to_new_map,
       std::vector<HloInstruction*>& fusion_inputs,
       HloComputation::Builder& builder);
   // Propagate dimension orders in consumer->producer direction starting at
@@ -428,9 +429,7 @@ class FusionContext {
  private:
   DimOrderUpdatesOrError AnalyzeForFusionImpl(
       const HloInstruction& hlo, TransformDirection transform_direction,
-      absl::flat_hash_map<const HloInstruction*, HloInstruction*>&
-          old_to_new_mapping,
-      const DimOrderMap& dim_orders,
+      OldToNewHloMap& old_to_new_map, const DimOrderMap& dim_orders,
       se::GpuComputeCapability gpu_version) const;
   bool SetSplittableDimensionMajorPartSize(const int64_t size) {
     if (IsSupportedSplittableDimensionMajorPartSize(size)) {
@@ -760,8 +759,6 @@ DimOrderUpdatesOrError FusionContext::HandleDimensionAlteringOp(
 
   const HloInstruction* src =
       (direction == TransformDirection::kOutputToInput) ? hlo : hlo->operand(0);
-  const HloInstruction* dst =
-      (direction == TransformDirection::kOutputToInput) ? hlo->operand(0) : hlo;
   // Note: copying instead of using a const reference because
   // some operations (slice) will modify fragment properties in-place.
   Fragments src_fragments_order = dim_orders.at(src).TensorFragmentsOrder();
@@ -769,14 +766,6 @@ DimOrderUpdatesOrError FusionContext::HandleDimensionAlteringOp(
       ShapeUtil::IsEffectiveScalar(hlo->shape())) {
     return FusionDecision("Slice to scalar is not implemented yet.");
   }
-  DimOrderUpdates result;
-  if (hlo->opcode() == HloOpcode::kReduce || hlo->opcode() == HloOpcode::kPad) {
-    // Operand 1 (the neutral value or padding value) has to be a scalar.
-    result.map.insert({hlo->operand(1), DimensionOrder()});
-  }
-  DimensionOrder& dst_dim_order =
-      result.map.insert({dst, DimensionOrder()}).first->second;
-  Fragments& dst_fragments_order = dst_dim_order.TensorFragmentsOrder();
   // Every HLO dimension can correspond to a group of subdimensions in
   // dim_order_. For the easier handling of permutations: group dim_order_ by
   // dimension, apply permutations, then finally remove the grouping.
@@ -798,136 +787,155 @@ DimOrderUpdatesOrError FusionContext::HandleDimensionAlteringOp(
     CHECK_EQ(subdim_size_accumulator, dim_size);
     src_physical.push_back(subdim_group);
   }
+
   // Source physical -> source logical.
   std::vector<std::vector<Fragment*>> src_logical;
   src_logical.resize(src_physical.size());
   for (int i = 0; i < src_physical.size(); ++i) {
     src_logical[src->shape().layout().minor_to_major(i)] = src_physical[i];
   }
-  // Source logical -> destination logical.
-  std::vector<std::vector<Fragment*>> dst_logical;
-  if (hlo->opcode() == HloOpcode::kTranspose) {
-    const auto* transpose = Cast<HloTransposeInstruction>(hlo);
-    std::vector<int64_t> permutation(transpose->dimensions().cbegin(),
-                                     transpose->dimensions().cend());
-    if (direction == TransformDirection::kInputToOutput) {
-      permutation = InversePermutation(permutation);
-    }
-    dst_logical.resize(permutation.size());
-    for (int i = 0; i < permutation.size(); ++i) {
-      dst_logical[permutation[i]] = src_logical[i];
-    }
-  } else if (hlo->opcode() == HloOpcode::kBroadcast) {
-    const auto* broadcast = Cast<HloBroadcastInstruction>(hlo);
-    dst_logical.resize(broadcast->dimensions().size());
-    for (int i = 0; i < broadcast->dimensions().size(); ++i) {
-      dst_logical[i] = src_logical[broadcast->dimensions()[i]];
-    }
-  } else if (hlo->opcode() == HloOpcode::kReduce) {
-    const auto* reduce = Cast<HloReduceInstruction>(hlo);
-    dst_logical.resize(src_logical.size() + reduce->dimensions().size());
-    if (reduce->dimensions().size() != 1) {
-      return FusionDecision("Unsupported reduction.");
-    }
-    for (int i = 0; i < dst_logical.size(); ++i) {
-      if (i == reduce->dimensions().front()) {
-        // This way to assign the reduction dimension will only work for
-        // softmax fusions with known patterns for now. Generally a reduction
-        // should create a new tiled dimension.
-        dst_logical[i] = {&new_fragments.emplace_back(
-            std::get<SoftmaxProperties>(properties_)
-                .softmax_reduction_dimension,
-            reduce->operand(0)->shape().dimensions(i))};
-      } else {
-        dst_logical[i] = src_logical[i];
-      }
-    }
-  } else if (hlo->opcode() == HloOpcode::kCopy) {
-    // Copy preserves the logical shape, just permutes the layout.
-    CHECK(ShapeUtil::SameDimensions(src->shape(), dst->shape()));
-    dst_logical = src_logical;
-  } else if (hlo->opcode() == HloOpcode::kPad) {
-    const auto* pad = Cast<HloPadInstruction>(hlo);
-    dst_logical.resize(src_logical.size());
-    for (int i = 0; i < src_logical.size(); ++i) {
-      // This only handles the padding added by PadDotOperandsIfNeededForSplitK,
-      // which sets only edge_padding_high.
-      const int padding =
-          pad->padding_config().dimensions(i).edge_padding_high();
-      CHECK_EQ(pad->padding_config().dimensions(i).edge_padding_low(), 0);
-      CHECK_EQ(pad->padding_config().dimensions(i).interior_padding(), 0);
-      if (padding == 0) {
-        dst_logical[i] = src_logical[i];
-      } else {
-        // This case is executed for the contracting dimension when we run the
-        // TritonFusionAnalysis after the padding and the split-k transform are
-        // applied.
-        const std::vector<Fragment*>& fragments = src_logical[i];
-        // We must have 2 fragments at this point.
-        CHECK_EQ(fragments.size(), 2);
-        // The dst_dim_numbers must be the same for the 2 fragments of the
-        // contracting dimension after applying split-k.
-        CHECK_EQ(fragments[0]->dst_dim_number(),
-                 fragments[1]->dst_dim_number());
 
-        new_fragments.emplace_back(
-            fragments[0]->dst_dim_number(),
-            fragments[0]->full_size() * fragments[1]->full_size() - padding);
-        dst_logical[i] = {&new_fragments.back()};
+  HloInstruction::InstructionVector output;
+  output.push_back(const_cast<HloInstruction*>(hlo));
+  DimOrderUpdates result;
+  for (const HloInstruction* dst :
+       (direction == TransformDirection::kInputToOutput) ? output
+                                                         : hlo->operands()) {
+    DimensionOrder& dst_dim_order =
+        result.map.insert({dst, DimensionOrder()}).first->second;
+    // Source logical -> destination logical.
+    std::vector<std::vector<Fragment*>> dst_logical;
+    if (hlo->opcode() == HloOpcode::kTranspose) {
+      const auto* transpose = Cast<HloTransposeInstruction>(hlo);
+      std::vector<int64_t> permutation(transpose->dimensions().cbegin(),
+                                       transpose->dimensions().cend());
+      if (direction == TransformDirection::kInputToOutput) {
+        permutation = InversePermutation(permutation);
       }
-    }
-  } else if (hlo->opcode() == HloOpcode::kSlice) {
-    const auto slice = Cast<HloSliceInstruction>(hlo);
-    dst_logical.resize(src_logical.size());
-    for (int dim = 0; dim < src_logical.size(); ++dim) {
-      dst_logical[dim] = src_logical[dim];
-      if (slice->slice_limits(dim) - slice->slice_starts(dim) !=
-          dst->shape().dimensions(dim)) {
-        if (dst_logical[dim].size() > 1) {
-          return FusionDecision("Slicing of fragmented dimension.");
-        }
-        dst_logical[dim].front()->set_size(dst->shape().dimensions(dim));
-        dst_logical[dim].front()->set_slice(slice->slice_starts(dim),
-                                            slice->slice_limits(dim));
+      dst_logical.resize(permutation.size());
+      for (int i = 0; i < permutation.size(); ++i) {
+        dst_logical[permutation[i]] = src_logical[i];
       }
-    }
-  } else {
-    return FusionDecision("Function called on a wrong instruction.");
-  }
-  // Destination logical -> destination physical and ungroup subdimensions.
-  // Map original fragments to the resulting ones to derive their new
-  // logical ordering within each dimension.
-  absl::flat_hash_map<const Fragment*, int> src_to_dst;
-  FragmentOrders& dst_dim_fragments_order = dst_dim_order.DimFragmentsOrders();
-  // Remember which dimensions are present before a broadcast;
-  // skip cases when already present dimension is being expanded.
-  absl::flat_hash_set<int> dim_numbers_present_in_dst;
-  for (const int64_t dim_idx : dst->shape().layout().minor_to_major()) {
-    for (const Fragment* subdim : dst_logical[dim_idx]) {
-      dst_fragments_order.push_back(*subdim);
-      src_to_dst[subdim] = dst_fragments_order.size() - 1;
-      dim_numbers_present_in_dst.insert(subdim->dst_dim_number());
-      if (std::holds_alternative<SoftmaxProperties>(properties_) &&
-          subdim->dst_dim_number() == std::get<SoftmaxProperties>(properties_)
-                                          .softmax_reduction_dimension) {
-        dst_dim_fragments_order[subdim->dst_dim_number()].push_back(
-            dst_fragments_order.size() - 1);
+    } else if (hlo->opcode() == HloOpcode::kBroadcast) {
+      const auto* broadcast = Cast<HloBroadcastInstruction>(hlo);
+      dst_logical.resize(broadcast->dimensions().size());
+      for (int i = 0; i < broadcast->dimensions().size(); ++i) {
+        dst_logical[i] = src_logical[broadcast->dimensions()[i]];
       }
-    }
-  }
-  for (const auto& [dim_index, dim_sequence] :
-       dim_orders.at(src).DimFragmentsOrders()) {
-    for (const int fragment_number : dim_sequence) {
-      const auto it = src_to_dst.find(&src_fragments_order[fragment_number]);
-      if (it == src_to_dst.cend()) {
-        if (hlo->opcode() == HloOpcode::kBroadcast &&
-            src_fragments_order[fragment_number].full_size() > 1 &&
-            dim_numbers_present_in_dst.contains(dim_index)) {
-          return FusionDecision("Unsupported broadcast");
-        }
+    } else if (hlo->opcode() == HloOpcode::kReduce) {
+      // Operand 1 (the neutral value) has to be a scalar.
+      if (dst != hlo && hlo->operand_index(dst) == 1) {
         continue;
       }
-      dst_dim_fragments_order[dim_index].push_back(it->second);
+      const auto* reduce = Cast<HloReduceInstruction>(hlo);
+      dst_logical.resize(src_logical.size() + reduce->dimensions().size());
+      if (reduce->dimensions().size() != 1) {
+        return FusionDecision("Unsupported reduction.");
+      }
+      for (int i = 0; i < dst_logical.size(); ++i) {
+        if (i == reduce->dimensions().front()) {
+          // This way to assign the reduction dimension will only work for
+          // softmax fusions with known patterns for now. Generally a reduction
+          // should create a new tiled dimension.
+          dst_logical[i] = {&new_fragments.emplace_back(
+              std::get<SoftmaxProperties>(properties_)
+                  .softmax_reduction_dimension,
+              reduce->operand(0)->shape().dimensions(i))};
+        } else {
+          dst_logical[i] = src_logical[i];
+        }
+      }
+    } else if (hlo->opcode() == HloOpcode::kCopy) {
+      // Copy preserves the logical shape, just permutes the layout.
+      CHECK(ShapeUtil::SameDimensions(src->shape(), dst->shape()));
+      dst_logical = src_logical;
+    } else if (hlo->opcode() == HloOpcode::kPad) {
+      // Operand 1 (the padding value) has to be a scalar.
+      if (dst != hlo && hlo->operand_index(dst) == 1) {
+        continue;
+      }
+      const auto* pad = Cast<HloPadInstruction>(hlo);
+      dst_logical.resize(src_logical.size());
+      for (int i = 0; i < src_logical.size(); ++i) {
+        // This only handles the padding added by
+        // PadDotOperandsIfNeededForSplitK, which sets only edge_padding_high.
+        const int padding =
+            pad->padding_config().dimensions(i).edge_padding_high();
+        CHECK_EQ(pad->padding_config().dimensions(i).edge_padding_low(), 0);
+        CHECK_EQ(pad->padding_config().dimensions(i).interior_padding(), 0);
+        if (padding == 0) {
+          dst_logical[i] = src_logical[i];
+        } else {
+          // This case is executed for the contracting dimension when we run the
+          // TritonFusionAnalysis after the padding and the split-k transform
+          // are applied.
+          const std::vector<Fragment*>& fragments = src_logical[i];
+          // We must have 2 fragments at this point.
+          CHECK_EQ(fragments.size(), 2);
+          // The dst_dim_numbers must be the same for the 2 fragments of the
+          // contracting dimension after applying split-k.
+          CHECK_EQ(fragments[0]->dst_dim_number(),
+                   fragments[1]->dst_dim_number());
+
+          new_fragments.emplace_back(
+              fragments[0]->dst_dim_number(),
+              fragments[0]->full_size() * fragments[1]->full_size() - padding);
+          dst_logical[i] = {&new_fragments.back()};
+        }
+      }
+    } else if (hlo->opcode() == HloOpcode::kSlice) {
+      const auto slice = Cast<HloSliceInstruction>(hlo);
+      dst_logical.resize(src_logical.size());
+      for (int dim = 0; dim < src_logical.size(); ++dim) {
+        dst_logical[dim] = src_logical[dim];
+        if (slice->slice_limits(dim) - slice->slice_starts(dim) !=
+            dst->shape().dimensions(dim)) {
+          if (dst_logical[dim].size() > 1) {
+            return FusionDecision("Slicing of fragmented dimension.");
+          }
+          auto fragment = dst_logical[dim].front();
+          fragment->set_size(dst->shape().dimensions(dim));
+          // Slicing of an already sliced dimension means adding offsets.
+          fragment->set_slice(
+              fragment->slice_start() + slice->slice_starts(dim),
+              fragment->slice_start() + slice->slice_starts(dim) +
+                  fragment->sliced_size());
+        }
+      }
+    } else {
+      return FusionDecision("Function called on a wrong instruction.");
+    }
+    // Destination logical -> destination physical and ungroup subdimensions.
+    // Map original fragments to the resulting ones to derive their new
+    // logical ordering within each dimension.
+    absl::flat_hash_map<const Fragment*, int> src_to_dst;
+    Fragments& dst_fragments_order = dst_dim_order.TensorFragmentsOrder();
+    FragmentOrders& dst_dim_fragments_order =
+        dst_dim_order.DimFragmentsOrders();
+    // Remember which dimensions are present before a broadcast;
+    // skip cases when already present dimension is being expanded.
+    absl::flat_hash_set<int> dim_numbers_present_in_dst;
+    for (const int64_t dim_idx : dst->shape().layout().minor_to_major()) {
+      for (const Fragment* subdim : dst_logical[dim_idx]) {
+        dst_fragments_order.push_back(*subdim);
+        src_to_dst[subdim] = dst_fragments_order.size() - 1;
+        dim_numbers_present_in_dst.insert(subdim->dst_dim_number());
+      }
+    }
+    for (const auto& [dim_index, dim_sequence] :
+         dim_orders.at(src).DimFragmentsOrders()) {
+      for (const int fragment_number : dim_sequence) {
+        const auto it = src_to_dst.find(&src_fragments_order[fragment_number]);
+        if (it == src_to_dst.cend()) {
+          if (hlo->opcode() == HloOpcode::kBroadcast &&
+              src_fragments_order[fragment_number].full_size() > 1 &&
+              dim_numbers_present_in_dst.contains(dim_index)) {
+            return FusionDecision("Unsupported broadcast");
+          }
+          continue;
+        }
+        dst_dim_fragments_order[dim_index].push_back(it->second);
+      }
     }
   }
   return result;
@@ -1043,18 +1051,15 @@ DimOrderUpdatesOrError FusionContext::RequireSupportedInstruction(
 
 DimOrderUpdatesOrError FusionContext::AnalyzeForFusion(
     const HloInstruction& hlo, const TransformDirection transform_direction,
-    absl::flat_hash_map<const HloInstruction*, HloInstruction*>&
-        old_to_new_mapping,
+    OldToNewHloMap& old_to_new_map,
     const se::GpuComputeCapability gpu_version) const {
-  return AnalyzeForFusionImpl(hlo, transform_direction, old_to_new_mapping,
+  return AnalyzeForFusionImpl(hlo, transform_direction, old_to_new_map,
                               dim_orders_, gpu_version);
 }
 
 DimOrderUpdatesOrError FusionContext::AnalyzeForFusionImpl(
     const HloInstruction& hlo, const TransformDirection transform_direction,
-    absl::flat_hash_map<const HloInstruction*, HloInstruction*>&
-        old_to_new_mapping,
-    const DimOrderMap& dim_orders,
+    OldToNewHloMap& old_to_new_map, const DimOrderMap& dim_orders,
     const se::GpuComputeCapability gpu_version) const {
   if (hlo.opcode() == HloOpcode::kTuple ||
       hlo.opcode() == HloOpcode::kGetTupleElement) {
@@ -1109,7 +1114,7 @@ DimOrderUpdatesOrError FusionContext::AnalyzeForFusionImpl(
               (operand->operand(0)->opcode() == HloOpcode::kParameter ||
                operand->operand(0)->opcode() == HloOpcode::kConstant) &&
               std::holds_alternative<DimOrderUpdates>(AnalyzeForFusionImpl(
-                  *operand, transform_direction, old_to_new_mapping,
+                  *operand, transform_direction, old_to_new_map,
                   std::get<DimOrderUpdates>(result).map, gpu_version))) {
             accepted = true;
             break;
@@ -1126,7 +1131,7 @@ DimOrderUpdatesOrError FusionContext::AnalyzeForFusionImpl(
     }
     for (const HloInstruction* operand : hlo.operands()) {
       // Skip already fused operands.
-      if (old_to_new_mapping.contains(operand)) {
+      if (old_to_new_map.contains(operand)) {
         continue;
       }
       // Currently only broadcasts of scalar constants or parameters
@@ -1145,40 +1150,65 @@ DimOrderUpdatesOrError FusionContext::AnalyzeForFusionImpl(
   return std::get<DimOrderUpdates>(result);
 }
 
+// Gets the fused HLO corresponding to `hlo` or adds a new parameter if not
+// found.
+HloInstruction* GetFusedHloOrAddParameter(
+    HloInstruction& hlo, OldToNewHloMap& old_to_new_map,
+    std::vector<HloInstruction*>& fusion_inputs,
+    HloComputation::Builder& builder) {
+  if (auto it = old_to_new_map.find(&hlo); it != old_to_new_map.end()) {
+    return it->second;
+  }
+  fusion_inputs.push_back(&hlo);
+  return old_to_new_map
+      .insert(
+          {&hlo, builder.AddInstruction(HloInstruction::CreateParameter(
+                     fusion_inputs.size() - 1, hlo.shape(),
+                     absl::StrCat("parameter_", fusion_inputs.size() - 1)))})
+      .first->second;
+}
+
 // Clone an instruction into the fusion.
-void Fuse(HloInstruction& hlo,
-          absl::flat_hash_map<const HloInstruction*, HloInstruction*>&
-              old_to_new_mapping,
+//
+// For the hero dot operation in the dot fusion, please use FuseDotOnly.
+void Fuse(HloInstruction& hlo, OldToNewHloMap& old_to_new_map,
           std::vector<HloInstruction*>& fusion_inputs,
           HloComputation::Builder& builder) {
-  if (old_to_new_mapping.contains(&hlo)) {
+  if (old_to_new_map.contains(&hlo)) {
     return;
   }
   VLOG(3) << "Fusing " << hlo.ToString();
-  auto get_or_add_parameter = [&](HloInstruction& instr) {
-    if (auto it = old_to_new_mapping.find(&instr);
-        it != old_to_new_mapping.end()) {
-      return it->second;
-    }
-    fusion_inputs.push_back(&instr);
-    return old_to_new_mapping
-        .insert({&instr,
-                 builder.AddInstruction(HloInstruction::CreateParameter(
-                     fusion_inputs.size() - 1, instr.shape(),
-                     absl::StrCat("parameter_", fusion_inputs.size() - 1)))})
-        .first->second;
-  };
   if (hlo.opcode() == HloOpcode::kParameter ||
       hlo.opcode() == HloOpcode::kGetTupleElement) {
-    get_or_add_parameter(hlo);
+    GetFusedHloOrAddParameter(hlo, old_to_new_map, fusion_inputs, builder);
   } else {
     std::vector<HloInstruction*> hlo_new_operands;
     for (HloInstruction* operand : hlo.operands()) {
-      hlo_new_operands.push_back(get_or_add_parameter(*operand));
+      hlo_new_operands.push_back(GetFusedHloOrAddParameter(
+          *operand, old_to_new_map, fusion_inputs, builder));
     }
-    old_to_new_mapping[&hlo] = builder.AddInstruction(
+    old_to_new_map[&hlo] = builder.AddInstruction(
         hlo.CloneWithNewOperands(hlo.shape(), hlo_new_operands));
   }
+}
+
+// Clones the hero kDot operation into the fusion.
+void FuseDotOnly(HloInstruction& hlo, OldToNewHloMap& output_old_to_new_map,
+                 OldToNewHloMap& lhs_old_to_new_map,
+                 OldToNewHloMap& rhs_old_to_new_map,
+                 std::vector<HloInstruction*>& fusion_inputs,
+                 HloComputation::Builder& builder) {
+  CHECK_EQ(hlo.opcode(), HloOpcode::kDot);
+  CHECK_EQ(hlo.operand_count(), 2);
+  VLOG(3) << "Fusing " << hlo.ToString();
+
+  std::array<HloInstruction*, 2> hlo_new_operands = {
+      GetFusedHloOrAddParameter(*hlo.mutable_operand(0), lhs_old_to_new_map,
+                                fusion_inputs, builder),
+      GetFusedHloOrAddParameter(*hlo.mutable_operand(1), rhs_old_to_new_map,
+                                fusion_inputs, builder)};
+  output_old_to_new_map[&hlo] = builder.AddInstruction(
+      hlo.CloneWithNewOperands(hlo.shape(), hlo_new_operands));
 }
 
 // Tells how many new parameters does a fusion gain by fusing the operation as
@@ -1213,9 +1243,7 @@ bool FusionContext::MergeUpdates(const DimOrderUpdates& updates) {
 
 void FusionContext::TryToFuseWithInputsRecursively(
     HloInstruction& root, const se::GpuComputeCapability gpu_version,
-    absl::flat_hash_map<const HloInstruction*, HloInstruction*>&
-        old_to_new_mapping,
-    std::vector<HloInstruction*>& fusion_inputs,
+    OldToNewHloMap& old_to_new_map, std::vector<HloInstruction*>& fusion_inputs,
     HloComputation::Builder& builder) {
   // Instructions at the fusion edge that can either get fused too or
   // become parameters of the fusion. Used to track the number of parameters.
@@ -1232,8 +1260,8 @@ void FusionContext::TryToFuseWithInputsRecursively(
     HloInstruction* hlo = to_visit.front();
     to_visit.pop();
     // Watch the total number of fusion parameters.
-    if (inputs.size() >= TritonFusionAnalysis::kMaxParameterPerScope &&
-        NumAddedParameters(*hlo) > 0) {
+    if (inputs.size() + NumAddedParameters(*hlo) >
+        TritonFusionAnalysis::kMaxParameterPerDotScope) {
       // Re-queue: the number of parameters may go down when other instructions
       // are processed.
       to_visit.push(hlo);
@@ -1242,9 +1270,8 @@ void FusionContext::TryToFuseWithInputsRecursively(
       continue;
     }
     num_requeued = 0;
-    const DimOrderUpdatesOrError result =
-        AnalyzeForFusion(*hlo, TransformDirection::kOutputToInput,
-                         old_to_new_mapping, gpu_version);
+    const DimOrderUpdatesOrError result = AnalyzeForFusion(
+        *hlo, TransformDirection::kOutputToInput, old_to_new_map, gpu_version);
     if (!std::holds_alternative<DimOrderUpdates>(result) ||
         !MergeUpdates(std::get<DimOrderUpdates>(result))) {
       continue;
@@ -1274,7 +1301,7 @@ void FusionContext::TryToFuseWithInputsRecursively(
         }
       }
       if (ready_to_fuse) {
-        Fuse(**it, old_to_new_mapping, fusion_inputs, builder);
+        Fuse(**it, old_to_new_map, fusion_inputs, builder);
         to_fuse_set.erase(*it);
         it = to_fuse_list.erase(it);
       } else {
@@ -1301,32 +1328,42 @@ StatusOr<FusionDecision> FuseDot(HloInstruction& dot,
     return can_handle;
   }
 
-  // Original instruction -> fused one.
-  absl::flat_hash_map<const HloInstruction*, HloInstruction*>
-      old_to_new_mapping;
-
   // Separate traversal from LHS and RHS inputs of the dot: they use
   // differently shaped tiles but may go through same HLO graph nodes.
   // Direct dot inputs have well defined dimension orders.
 
-  auto fuse_inputs = [&](int operand_number) -> StatusOr<FusionContext> {
+  auto fuse_inputs =
+      [&](int operand_number,
+          OldToNewHloMap& old_to_new_map) -> StatusOr<FusionContext> {
     const int operand_count_before = fusion_inputs.size();
     // Direct dot inputs have well defined dimension orders.
     auto context = FusionContext::FromDotOperand(dot, operand_number);
     context.TryToFuseWithInputsRecursively(*dot.mutable_operand(operand_number),
-                                           gpu_version, old_to_new_mapping,
+                                           gpu_version, old_to_new_map,
                                            fusion_inputs, builder);
-    TF_RET_CHECK(fusion_inputs.size() - operand_count_before <=
-                 TritonFusionAnalysis::kMaxParameterPerScope);
+    const int new_parameters = fusion_inputs.size() - operand_count_before;
+    TF_RET_CHECK(new_parameters <=
+                 TritonFusionAnalysis::kMaxParameterPerDotScope)
+        << "Too many new parameters: " << new_parameters << " > "
+        << TritonFusionAnalysis::kMaxParameterPerDotScope;
     return context;
   };
 
-  TF_ASSIGN_OR_RETURN(const FusionContext lhs_context, fuse_inputs(0));
-  if (auto result = fuse_inputs(1); !result.ok()) {
+  // Original instruction -> fused one. Separate for each scope.
+  OldToNewHloMap lhs_old_to_new_map;
+  TF_ASSIGN_OR_RETURN(const FusionContext lhs_context,
+                      fuse_inputs(0, lhs_old_to_new_map));
+
+  OldToNewHloMap rhs_old_to_new_map;
+  if (auto result = fuse_inputs(1, rhs_old_to_new_map); !result.ok()) {
     return result.status();
   }
 
-  Fuse(dot, old_to_new_mapping, fusion_inputs, builder);
+  OldToNewHloMap output_old_to_new_map;
+  // Fuse the dot into output_old_to_new_map and use lhs_old_to_new_map and
+  // rhs_old_to_new_map to generate / determine its operands.
+  FuseDotOnly(dot, output_old_to_new_map, lhs_old_to_new_map,
+              rhs_old_to_new_map, fusion_inputs, builder);
 
   // Fusion at dot's output.
 
@@ -1346,18 +1383,19 @@ StatusOr<FusionDecision> FuseDot(HloInstruction& dot,
     }
     auto result =
         context.AnalyzeForFusion(*user, TransformDirection::kInputToOutput,
-                                 old_to_new_mapping, gpu_version);
+                                 output_old_to_new_map, gpu_version);
     if (!std::holds_alternative<DimOrderUpdates>(result)) {
       continue;
     }
     TF_RET_CHECK(context.MergeUpdates(std::get<DimOrderUpdates>(result)));
     for (HloInstruction* operand : user->operands()) {
-      if (!old_to_new_mapping.contains(operand)) {
-        context.TryToFuseWithInputsRecursively(
-            *operand, gpu_version, old_to_new_mapping, fusion_inputs, builder);
+      if (!output_old_to_new_map.contains(operand)) {
+        context.TryToFuseWithInputsRecursively(*operand, gpu_version,
+                                               output_old_to_new_map,
+                                               fusion_inputs, builder);
       }
     }
-    Fuse(*user, old_to_new_mapping, fusion_inputs, builder);
+    Fuse(*user, output_old_to_new_map, fusion_inputs, builder);
     fusion_output = user;
     output_changed = true;
   }
@@ -1367,11 +1405,17 @@ StatusOr<FusionDecision> FuseDot(HloInstruction& dot,
   if (dot.GetModule()->config().debug_options().xla_gpu_triton_gemm_any()) {
     return FusionDecision{};
   }
-  for (const auto& iter : old_to_new_mapping) {
-    if (iter.second->opcode() == HloOpcode::kConvert ||
-        iter.second->opcode() == HloOpcode::kSlice ||
-        iter.second->opcode() == HloOpcode::kTranspose) {
-      return FusionDecision{};
+
+  for (auto* old_to_new_map : std::array<const OldToNewHloMap*, 3>{
+           &lhs_old_to_new_map, &rhs_old_to_new_map, &output_old_to_new_map}) {
+    for (auto [_, new_hlo] : *old_to_new_map) {
+      static constexpr std::array<HloOpcode, 4> kPureOpcodes = {
+          HloOpcode::kBitcast, HloOpcode::kDot, HloOpcode::kParameter,
+          HloOpcode::kReshape};
+      // Fuse if this is not a "pure" matmul.
+      if (absl::c_find(kPureOpcodes, new_hlo->opcode()) == kPureOpcodes.end()) {
+        return FusionDecision{};
+      }
     }
   }
   return "No profitable operations to fuse.";
@@ -1653,6 +1697,7 @@ const DimIterationSpec* TritonFusionAnalysis::IterSpec(
 FusionDecision CanTritonHandleGEMM(const HloInstruction& dot,
                                    const se::GpuComputeCapability gpu_version) {
   if (dot.opcode() != HloOpcode::kDot ||
+      !tsl::tensor_float_32_execution_enabled() ||
       absl::c_any_of(dot.precision_config().operand_precision(),
                      [](int x) { return x != PrecisionConfig::DEFAULT; })) {
     return "Non-default precision.";

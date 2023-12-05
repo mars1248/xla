@@ -31,6 +31,7 @@ limitations under the License.
 
 #include "absl/functional/any_invocable.h"
 #include "absl/status/status.h"
+#include "absl/types/span.h"
 #include "xla/stream_executor/allocator_stats.h"
 #include "xla/stream_executor/blas.h"
 #include "xla/stream_executor/command_buffer.h"
@@ -41,7 +42,6 @@ limitations under the License.
 #include "xla/stream_executor/event.h"
 #include "xla/stream_executor/fft.h"
 #include "xla/stream_executor/kernel.h"
-#include "xla/stream_executor/kernel_cache_config.h"
 #include "xla/stream_executor/kernel_spec.h"
 #include "xla/stream_executor/launch_dim.h"
 #include "xla/stream_executor/module_spec.h"
@@ -78,7 +78,7 @@ class EventInterface {
 // KernelInterface
 //===----------------------------------------------------------------------===//
 
-// Pointer-to-implementation object type (i.e. the KernelBase class delegates to
+// Pointer-to-implementation object type (i.e. the Kernel class delegates to
 // this interface) with virtual destruction. This class exists for the
 // platform-dependent code to hang any kernel data/resource info/functionality
 // off of.
@@ -131,8 +131,7 @@ class CommandBufferInterface {
 
   // Adds a kernel launch command to the command buffer.
   virtual tsl::Status Launch(const ThreadDim& threads, const BlockDim& blocks,
-                             const KernelBase& kernel,
-                             const KernelArgsArrayBase& args) = 0;
+                             const Kernel& kernel, const KernelArgs& args) = 0;
 
   // Adds a nested command buffer to the command buffer.
   virtual tsl::Status AddNestedCommandBuffer(const CommandBuffer& nested) = 0;
@@ -141,6 +140,23 @@ class CommandBufferInterface {
   virtual tsl::Status MemcpyDeviceToDevice(DeviceMemoryBase* dst,
                                            const DeviceMemoryBase& src,
                                            uint64_t size) = 0;
+
+  // For all conditional command APIs defined below, nested command buffers
+  // constructed for conditional branches owned by *this and should never be
+  // finalized or updated inside builders.
+
+  // Adds a conditional operation that will run a command buffer constructed by
+  // `then_builder` if `predicate` value is `true`.
+  virtual tsl::Status If(StreamExecutor* executor, DeviceMemory<bool> predicate,
+                         CommandBuffer::Builder then_builder) = 0;
+
+  // Adds a conditional operation that will run a command buffer constructed by
+  // `then_builder` if `predicate` value is `true`, or a command buffer
+  // constructed by `else_builder` if `predicate` is `false`.
+  virtual tsl::Status IfElse(StreamExecutor* executor,
+                             DeviceMemory<bool> predicate,
+                             CommandBuffer::Builder then_builder,
+                             CommandBuffer::Builder else_builder) = 0;
 
   // Finalizes command buffer and makes it executable. Once command buffer is
   // finalized no commands can be added to it.
@@ -234,7 +250,7 @@ class StreamExecutorInterface {
   }
 
   virtual tsl::Status GetKernel(const MultiKernelLoaderSpec& spec,
-                                KernelBase* kernel) {
+                                Kernel* kernel) {
     return absl::UnimplementedError("Not Implemented");
   }
   virtual bool UnloadModule(ModuleHandle module_handle) { return false; }
@@ -243,12 +259,12 @@ class StreamExecutorInterface {
     return absl::UnimplementedError("Not Implemented");
   }
   virtual tsl::StatusOr<std::shared_ptr<DeviceMemoryBase>>
-  CreateOrShareConstant(Stream* stream, const std::vector<uint8_t>& content) {
+  CreateOrShareConstant(Stream* stream, absl::Span<const uint8_t> content) {
     return absl::UnimplementedError("Not Implemented");
   }
   virtual tsl::Status Launch(Stream* stream, const ThreadDim& thread_dims,
-                             const BlockDim& block_dims, const KernelBase& k,
-                             const KernelArgsArrayBase& args) {
+                             const BlockDim& block_dims, const Kernel& k,
+                             const KernelArgs& args) {
     return absl::UnimplementedError("Not Implemented");
   }
 
@@ -258,7 +274,7 @@ class StreamExecutorInterface {
   }
 
   // Releases any state associated with the kernel.
-  virtual void UnloadKernel(const KernelBase* kernel) {}
+  virtual void UnloadKernel(const Kernel* kernel) {}
   virtual DeviceMemoryBase Allocate(uint64_t size, int64_t memory_space) = 0;
   DeviceMemoryBase Allocate(uint64_t size) {
     return Allocate(size, /*memory_space=*/0);

@@ -20,50 +20,57 @@ limitations under the License.
 
 #include <cstdint>
 #include <cstring>
-#include <map>
-#include <set>
 #include <string>
-#include <utility>
+#include <variant>
+#include <vector>
 
 #include "absl/base/casts.h"
 #include "absl/base/const_init.h"
 #include "absl/base/optimization.h"
 #include "absl/container/inlined_vector.h"
 #include "absl/debugging/leak_check.h"
-#include "absl/memory/memory.h"
+#include "absl/log/check.h"
+#include "absl/status/status.h"
+#include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/synchronization/notification.h"
+#include "absl/types/span.h"
 #include "third_party/gpus/cuda/include/cuda.h"
 #include "third_party/gpus/cuda/include/cuda_runtime_api.h"
 #include "third_party/gpus/cuda/include/driver_types.h"
-#include "xla/stream_executor/cuda/cuda_diagnostics.h"
+#include "xla/stream_executor/device_options.h"
+#include "xla/stream_executor/gpu/gpu_diagnostics.h"
 #include "xla/stream_executor/gpu/gpu_driver.h"
 #include "xla/stream_executor/gpu/gpu_types.h"
-#include "xla/stream_executor/platform/port.h"
+#include "xla/stream_executor/platform.h"
 #include "tsl/platform/env.h"
 #include "tsl/platform/errors.h"
 #include "tsl/platform/logging.h"
+#include "tsl/platform/macros.h"
+#include "tsl/platform/numbers.h"
 #include "tsl/platform/stacktrace.h"
 #include "tsl/platform/status.h"
+#include "tsl/platform/statusor.h"
 #include "tsl/platform/threadpool.h"
 
 static constexpr bool FLAGS_gpuexec_cuda_driver_inject_init_error = false;
 static constexpr bool FLAGS_gpuexec_cuda_sync_around_driver_calls = false;
 static constexpr bool FLAGS_gpuexec_cuda_device_0_only = false;
 
-#define RETURN_IF_CUDA_RES_ERROR(expr, ...)                                   \
-  do {                                                                        \
-    CUresult _res = (expr);                                                   \
-    if (ABSL_PREDICT_FALSE(_res != CUDA_SUCCESS)) {                           \
-      if (_res == CUDA_ERROR_OUT_OF_MEMORY)                                   \
-        return tsl::errors::ResourceExhausted(                                \
-            __VA_ARGS__, ":", ::stream_executor::gpu::ToString(_res));        \
-      else                                                                    \
-        return tsl::errors::Internal(__VA_ARGS__, ": ",                       \
-                                     ::stream_executor::gpu::ToString(_res)); \
-    }                                                                         \
+#define RETURN_IF_CUDA_RES_ERROR(expr, ...)                              \
+  do {                                                                   \
+    CUresult _res = (expr);                                              \
+    if (ABSL_PREDICT_FALSE(_res != CUDA_SUCCESS)) {                      \
+      if (_res == CUDA_ERROR_OUT_OF_MEMORY)                              \
+        return absl::ResourceExhaustedError(absl::StrCat(                \
+            __VA_ARGS__, ":", ::stream_executor::gpu::ToString(_res)));  \
+      else                                                               \
+        return absl::InternalError(absl::StrCat(                         \
+            __VA_ARGS__, ": ", ::stream_executor::gpu::ToString(_res))); \
+    }                                                                    \
   } while (0)
 
 #define FAIL_IF_CUDA_RES_ERROR(expr, ...)                   \
@@ -692,6 +699,13 @@ GpuDriver::GraphNodeGetType(CUgraphNode node) {
   return ::tsl::OkStatus();
 }
 
+/* static */ tsl::Status GpuDriver::DeviceGraphMemTrim(CUdevice device) {
+  VLOG(2) << "Trim CUDA device graph memory " << device;
+  RETURN_IF_CUDA_RES_ERROR(cuDeviceGraphMemTrim(device),
+                           "Failed to trim device graph memory");
+  return tsl::OkStatus();
+}
+
 /* static */ tsl::StatusOr<bool> GpuDriver::StreamIsCapturing(CUstream stream) {
   VLOG(2) << "Checking if stream " << stream << " is capturing";
 
@@ -700,6 +714,76 @@ GpuDriver::GraphNodeGetType(CUgraphNode node) {
                            "Failed to check stream capturing status");
 
   return status == CU_STREAM_CAPTURE_STATUS_ACTIVE;
+}
+
+/* static */ tsl::Status GpuDriver::GraphConditionalHandleCreate(
+    GpuGraphConditionalHandle* handle, CUgraph graph, GpuContext* context,
+    unsigned int default_launch_value, unsigned int flags) {
+  VLOG(2) << "Create conditional handle for a graph " << graph
+          << "; context: " << context
+          << "; default_launch_value: " << default_launch_value
+          << "; flags: " << flags;
+
+#if CUDA_VERSION >= 12030
+  RETURN_IF_CUDA_RES_ERROR(
+      cuGraphConditionalHandleCreate(handle, graph, context->context(),
+                                     default_launch_value, flags),
+      "Failed to create conditional handle for a CUDA graph");
+#else
+  return absl::UnimplementedError(
+      "CUDA graph conditional nodes are not implemented");
+#endif  // CUDA_VERSION >= 12030
+  return ::tsl::OkStatus();
+}
+
+/* static */ tsl::StatusOr<GpuDriver::GpuGraphNodeResult>
+GpuDriver::GraphAddNode(CUgraphNode* node, CUgraph graph,
+                        absl::Span<CUgraphNode> deps,
+                        const GpuGraphNodeParams& params) {
+#if CUDA_VERSION >= 12030
+  // Add conditional node to a graph.
+  if (auto* conditional = std::get_if<GpuGraphConditionalNodeParams>(&params)) {
+    VLOG(2) << "Add conditional node to a graph " << graph
+            << "; deps: " << deps.size();
+
+    CUgraphNodeParams cu_params;
+    memset(&cu_params, 0, sizeof(cu_params));
+
+    cu_params.type = CU_GRAPH_NODE_TYPE_CONDITIONAL;
+    cu_params.conditional.handle = conditional->handle;
+    cu_params.conditional.ctx = conditional->context->context();
+    cu_params.conditional.size = 1;
+
+    switch (conditional->type) {
+      case GpuDriver::GpuGraphConditionalNodeParams::Type::kIf:
+        cu_params.conditional.type = CU_GRAPH_COND_TYPE_IF;
+        break;
+    }
+
+    RETURN_IF_CUDA_RES_ERROR(
+        cuGraphAddNode(node, graph, deps.data(), deps.size(), &cu_params),
+        "Failed to add conditional node to a CUDA graph");
+
+    GpuGraphConditionalNodeParams::Result result;
+    result.graph = cu_params.conditional.phGraph_out[0];
+
+    VLOG(2) << "Created conditional CUDA graph " << result.graph;
+    return result;
+  }
+#endif  // CUDA_VERSION >= 12030
+
+  return absl::UnimplementedError("unsupported node type");
+}
+
+/* static */ tsl::Status GpuDriver::GraphAddEmptyNode(
+    CUgraphNode* node, CUgraph graph, absl::Span<CUgraphNode> deps) {
+  VLOG(2) << "Add empty node to a graph " << graph << "; deps: " << deps.size();
+
+  RETURN_IF_CUDA_RES_ERROR(
+      cuGraphAddEmptyNode(node, graph, deps.data(), deps.size()),
+      "Failed to add empty node to a CUDA graph");
+
+  return tsl::OkStatus();
 }
 
 /* static */ tsl::Status GpuDriver::GraphAddKernelNode(
@@ -745,14 +829,13 @@ GpuDriver::GraphNodeGetType(CUgraphNode node) {
 }
 
 /*static*/ tsl::Status GpuDriver::GraphExecKernelNodeSetParams(
-    GpuGraphExecHandle exec, GpuGraphNodeHandle node,
-    absl::string_view kernel_name, GpuFunctionHandle function,
-    unsigned int grid_dim_x, unsigned int grid_dim_y, unsigned int grid_dim_z,
-    unsigned int block_dim_x, unsigned int block_dim_y,
+    CUgraphExec exec, CUgraphNode node, absl::string_view kernel_name,
+    CUfunction function, unsigned int grid_dim_x, unsigned int grid_dim_y,
+    unsigned int grid_dim_z, unsigned int block_dim_x, unsigned int block_dim_y,
     unsigned int block_dim_z, unsigned int shared_mem_bytes,
     void** kernel_params, void** extra) {
-  VLOG(2) << "Set kernel node params " << node << " in graph executabe " << exec
-          << "; kernel: " << kernel_name << "; gdx: " << grid_dim_x
+  VLOG(2) << "Set kernel node params " << node << " in graph executable "
+          << exec << "; kernel: " << kernel_name << "; gdx: " << grid_dim_x
           << " gdy: " << grid_dim_y << " gdz: " << grid_dim_z
           << " bdx: " << block_dim_x << " bdy: " << block_dim_y
           << " bdz: " << block_dim_z << "; shmem: " << shared_mem_bytes;
@@ -822,6 +905,19 @@ GpuDriver::GraphNodeGetType(CUgraphNode node) {
   RETURN_IF_CUDA_RES_ERROR(
       cuGraphAddChildGraphNode(node, graph, deps.data(), deps.size(), child),
       "Failed to create a child graph node and add it to a CUDA graph");
+
+  return ::tsl::OkStatus();
+}
+
+/*static*/ tsl::Status GpuDriver::GraphExecChildNodeSetParams(CUgraphExec exec,
+                                                              CUgraphNode node,
+                                                              CUgraph child) {
+  VLOG(2) << "Set child node params " << node << " in graph executable " << exec
+          << "to params contained in " << child;
+
+  RETURN_IF_CUDA_RES_ERROR(
+      cuGraphExecChildGraphNodeSetParams(exec, node, child),
+      "Failed to set CUDA graph child node params");
 
   return ::tsl::OkStatus();
 }
@@ -919,8 +1015,16 @@ GpuDriver::GraphNodeGetType(CUgraphNode node) {
                                               : 0] = '\0';
       LOG(ERROR) << "error log buffer (" << error_log_buffer_bytes
                  << " bytes): " << error_log_buffer.data();
-      ret = tsl::errors::Internal("Failed to load PTX text as a module: ",
-                                  ToString(res));
+      if (absl::StrContains(error_log_buffer.data(),
+                            "Register allocation failed")) {
+        ret = absl::ResourceExhaustedError(
+            absl::StrFormat("Failed to load PTX text as a module (register "
+                            "allocation failed): %s",
+                            ToString(res)));
+      } else {
+        ret = absl::InternalError(absl::StrFormat(
+            "Failed to load PTX text as a module: %s", ToString(res)));
+      }
       notification.Notify();
     }
 
@@ -1591,21 +1695,15 @@ GpuDriver::CreateMemoryHandle(GpuContext* context, uint64_t bytes) {
   ScopedActivateContext activation(context);
   CUresult result;
 
-  // Check if the stream is doing graph capture.
-  cudaStreamCaptureStatus stream_capture_status;
-  cudaError_t err =
-      cudaStreamGetCaptureInfo(stream, &stream_capture_status, /*pId=*/nullptr);
-  if (err != cudaSuccess) {
-    LOG(ERROR) << "Failed to get stream capture info: "
-               << cudaGetErrorString(err);
+  // In graph capture mode we never have operations that access peer memory, so
+  // we can always make a call to cuMemcpyDtoDAsync.
+  tsl::StatusOr<bool> is_capturing = StreamIsCapturing(stream);
+  if (!is_capturing.ok()) {
+    LOG(ERROR) << is_capturing.status().message();
     return false;
   }
 
-  // In graph capture mode we never have operations that access peer memory, so
-  // we can always make a call to cuMemcpyDtoDAsync.
-  bool is_capturing = stream_capture_status == cudaStreamCaptureStatusActive;
-
-  if ((gpu_dst == 0 || gpu_src == 0) || is_capturing) {
+  if ((gpu_dst == 0 || gpu_src == 0) || (*is_capturing)) {
     // CreatedContexts::GetAnyContext() doesn't works when ptr == 0.
     // This happens when the size is 0.
     result = cuMemcpyDtoDAsync(gpu_dst, gpu_src, size, stream);

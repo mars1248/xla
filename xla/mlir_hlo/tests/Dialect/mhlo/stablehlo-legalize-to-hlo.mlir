@@ -715,7 +715,8 @@ func.func @op_custom_call_api_version_typed_ffi(%arg0: tensor<f32>) -> tensor<f3
   // CHECK-SAME: } : (tensor<f32>) -> tensor<f32>
   %0 = "stablehlo.custom_call"(%arg0) {
     call_target_name = "mhlo.custom_call",
-    mhlo.attributes = {api_version = 4 : i32, backend_config = {foo = "bar"}, call_target_name = "foo"}
+    mhlo.attributes = {api_version = 4 : i32, backend_config = {foo = "bar"}, call_target_name = "foo"},
+    mhlo.version = 1 : i64
   } : (tensor<f32>) -> tensor<f32>
   return %0 : tensor<f32>
 }
@@ -729,7 +730,7 @@ func.func @op_custom_call_mhlo_backend_config(%arg0: tensor<16x256xbf16>) -> ten
   // CHECK-SAME: } : (tensor<16x256xbf16>) -> tensor<16x4xbf16>
   %4 = stablehlo.custom_call @foo(%arg0) {
     "mhlo.backend_config" = {aggregate_to_topk = true}
-    } : (tensor<16x256xbf16>) -> tensor<16x4xbf16>
+  } : (tensor<16x256xbf16>) -> tensor<16x4xbf16>
   return %4 : tensor<16x4xbf16>
 }
 
@@ -1837,12 +1838,19 @@ func.func @type_quantization(%arg0: tensor<!quant.uniform<i8:f32, 34.0:16>>, %ar
   func.return %0 : tensor<f32>
 }
 
+// -----
+
+#SV = #sparse_tensor.encoding<{ map = (d0) -> (d0 : compressed) }>
+
+// CHECK: #[[$SV:.*]] = #sparse_tensor.encoding<{ map = (d0) -> (d0 : compressed) }>
 // CHECK-LABEL: "type_sparsity"
-func.func @type_sparsity(%arg0: tensor<16xf32, #sparse_tensor.encoding<{ map = (d0) -> (d0 : compressed) }>>) -> tensor<16xf32> {
-  // CHECK: "mhlo.abs"(%arg0) : (tensor<16xf32, #sparse_tensor.encoding<{ map = (d0) -> (d0 : compressed) }>>) -> tensor<16xf32>
-  %0 = "stablehlo.abs"(%arg0) : (tensor<16xf32, #sparse_tensor.encoding<{ map = (d0) -> (d0 : compressed) }>>) -> tensor<16xf32>
+func.func @type_sparsity(%arg0: tensor<16xf32, #SV>) -> tensor<16xf32> {
+  // CHECK: "mhlo.abs"(%arg0) : (tensor<16xf32, #[[$SV]]>) -> tensor<16xf32>
+  %0 = "stablehlo.abs"(%arg0) : (tensor<16xf32, #SV>) -> tensor<16xf32>
   func.return %0 : tensor<16xf32>
 }
+
+// -----
 
 func.func @type_token_callee(%arg0: !stablehlo.token) -> !stablehlo.token {
   // CHECK: function_type = (!mhlo.token) -> !mhlo.token, sym_name = "type_token_callee"

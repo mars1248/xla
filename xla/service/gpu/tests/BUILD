@@ -145,6 +145,7 @@ xla_cc_test(
     deps = [
         ":gpu_codegen_test",
         "//xla:statusor",
+        "//xla:test",
         "//xla:xla_proto_cc",
         "//xla/hlo/ir:hlo",
         "//xla/service:gpu_plugin",
@@ -696,6 +697,9 @@ xla_cc_test(
 xla_cc_test(
     name = "sorting_test",
     srcs = ["sorting_test.cc"],
+    local_defines = if_cuda_is_configured(["GOOGLE_CUDA=1"]) + if_rocm_is_configured([
+        "TENSORFLOW_USE_ROCM=1",
+    ]),
     tags = tf_cuda_tests_tags(),
     deps = [
         ":gpu_codegen_test",
@@ -731,6 +735,7 @@ xla_cc_binary(
     deps = [
         "//xla:status",
         "//xla/hlo/ir:hlo",
+        "//xla/service/gpu:buffer_sharing",
         "//xla/service/gpu:compile_module_to_llvm_ir",
         "//xla/service/gpu:gpu_compiler",
         "//xla/service/gpu:gpu_device_info_for_tests",
@@ -875,6 +880,7 @@ xla_test(
         ":gpu_codegen_test",
         "//xla:error_spec",
         "//xla/tests:hlo_test_base",
+        "@com_google_googletest//:gtest",
         "@tsl//tsl/platform:tensor_float_32_utils",
         "@tsl//tsl/platform:test_main",
     ],

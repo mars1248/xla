@@ -213,7 +213,9 @@ xla_cc_test(
     name = "types_test",
     size = "small",
     srcs = ["types_test.cc"],
-    visibility = [":friends"],
+    visibility = [
+        "//visibility:private",  # Only private by automation, not intent. Owner may accept CLs adding visibility. See go/scheuklappen#explicit-private.
+    ],
     deps = [
         ":test",
         ":types",
@@ -464,6 +466,7 @@ xla_cc_test(
         ":shape_util",
         ":test",
         ":xla_data_proto_cc",
+        "//xla:status",
         "@com_google_absl//absl/hash:hash_testing",
         "@tsl//tsl/platform:test_benchmark",
         "@tsl//tsl/platform:test_main",
@@ -1071,6 +1074,7 @@ cc_library(
             "@com_google_absl//absl/strings",
             "@com_google_absl//absl/strings:str_format",
             "@tsl//tsl/platform:logging",
+            "@tsl//tsl/platform:protobuf",
             "@tsl//tsl/util:command_line_flags",
         ],
 )

@@ -30,7 +30,6 @@ cc_library(
         ":auto_sharding_cost_graph",
         ":auto_sharding_option",
         ":auto_sharding_solver",
-        ":auto_sharding_solver_option",
         ":auto_sharding_strategy",
         ":auto_sharding_util",
         ":auto_sharding_wrapper",
@@ -51,9 +50,11 @@ cc_library(
         "//xla/service:buffer_value",
         "//xla/service:call_graph",
         "//xla/service:computation_layout",
+        "//xla/service:dot_as_convolution_util",
         "//xla/service:dump",
         "//xla/service:hlo_alias_analysis",
         "//xla/service:hlo_buffer",
+        "//xla/service:hlo_cost_analysis",
         "//xla/service:hlo_memory_scheduler",
         "//xla/service:hlo_pass",
         "//xla/service:hlo_value",
@@ -99,6 +100,7 @@ cc_library(
         "@com_google_absl//absl/time",
         "@com_google_ortools//ortools/linear_solver",
         "@com_google_ortools//ortools/linear_solver:linear_solver_cc_proto",
+        "@tsl//tsl/platform:fingerprint",
         "@tsl//tsl/platform:hash",
         "@tsl//tsl/platform:types",
     ] + auto_sharding_solver_deps(),
@@ -128,12 +130,17 @@ cc_library(
     deps = [
         ":auto_sharding_strategy",
         ":matrix",
+        "//xla:shape_util",
+        "//xla/hlo/ir:hlo",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/types:span",
     ],
 )
 
 cc_library(
     name = "auto_sharding_option",
+    srcs = ["auto_sharding_option.cc"],
     hdrs = ["auto_sharding_option.h"],
     deps = [
         ":auto_sharding_util",
@@ -150,9 +157,11 @@ cc_library(
     hdrs = ["auto_sharding_wrapper.h"],
     deps = [
         ":auto_sharding_cost_graph",
+        ":auto_sharding_option",
         ":auto_sharding_strategy",
         "//xla/hlo/ir:hlo",
         "//xla/hlo/utils:hlo_live_range",
+        "//xla/service:hlo_cost_analysis",
         "@com_google_absl//absl/container:flat_hash_map",
     ],
 )
@@ -167,6 +176,7 @@ cc_library(
         ":auto_sharding_wrapper",
         "//xla/hlo/ir:hlo",
         "//xla/hlo/utils:hlo_live_range",
+        "//xla/service:hlo_cost_analysis",
         "@com_google_absl//absl/container:flat_hash_map",
     ],
 )
@@ -185,7 +195,7 @@ cc_library(
     srcs = ["cluster_environment.cc"],
     hdrs = ["cluster_environment.h"],
     deps = [
-        ":auto_sharding_solver_option",
+        ":auto_sharding_option",
         ":auto_sharding_strategy",
         ":auto_sharding_util",
         ":profiling_result",
@@ -201,11 +211,6 @@ cc_library(
 )
 
 cc_library(
-    name = "auto_sharding_solver_option",
-    hdrs = ["auto_sharding_solver_option.h"],
-)
-
-cc_library(
     name = "auto_sharding_util",
     srcs = ["auto_sharding_util.cc"],
     hdrs = ["auto_sharding_util.h"],
@@ -214,6 +219,7 @@ cc_library(
         "//xla:array",
         "//xla:shape_tree",
         "//xla:shape_util",
+        "//xla:status",
         "//xla:statusor",
         "//xla:xla_data_proto_cc",
         "//xla/hlo/ir:hlo",
@@ -265,6 +271,11 @@ build_test(
 xla_cc_test(
     name = "auto_sharding_test",
     srcs = ["auto_sharding_test.cc"],
+    tags = [
+        # Disabled until autosharding is fully supported in OSS,
+        # https://github.com/openxla/xla/issues/7248.
+        "no_oss",
+    ],
     deps = [
         ":auto_sharding",
         ":auto_sharding_option",
@@ -284,6 +295,11 @@ xla_cc_test(
 xla_cc_test(
     name = "auto_sharding_solver_test",
     srcs = ["auto_sharding_solver_test.cc"],
+    tags = [
+        # Disabled until autosharding is fully supported in OSS,
+        # https://github.com/openxla/xla/issues/7248.
+        "no_oss",
+    ],
     deps = [
         ":auto_sharding_solver",
         ":auto_sharding_strategy",
