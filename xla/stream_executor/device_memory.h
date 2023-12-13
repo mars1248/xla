@@ -26,6 +26,9 @@ limitations under the License.
 
 #include <stddef.h>
 
+#include <cstddef>
+#include <cstdint>
+
 #include "xla/stream_executor/platform/port.h"
 
 namespace stream_executor {
@@ -54,6 +57,7 @@ class DeviceMemoryBase {
   // Returns whether the backing memory is the null pointer.
   // A `== nullptr` convenience method is also provided.
   bool is_null() const { return opaque_ == nullptr; }
+
   bool operator==(std::nullptr_t other) const { return is_null(); }
   bool operator!=(std::nullptr_t other) const { return !is_null(); }
 
@@ -96,7 +100,13 @@ class DeviceMemoryBase {
   }
 
  private:
-  void *opaque_;  // Platform-dependent value representing allocated memory.
+  // Platform-dependent value representing allocated memory.
+  //
+  // User may also constructs the object with `kExternalAllocationMarker`
+  // address and non-zero size, which indicates the case that buffer is
+  // allocated externally (for Gpu backends we use it to allocate memory via
+  // command buffer APIs).
+  void *opaque_;
   uint64_t size_;         // Size in bytes of this allocation.
   uint64_t payload_ = 0;  // Payload data associated with this allocation.
 };

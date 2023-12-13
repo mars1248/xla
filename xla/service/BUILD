@@ -3975,6 +3975,7 @@ cc_library(
     hdrs = ["hlo_cost_analysis.h"],
     deps = [
         "//xla:shape_util",
+        "//xla:status",
         "//xla:status_macros",
         "//xla:statusor",
         "//xla:util",
@@ -4163,6 +4164,7 @@ cc_library(
         "@com_google_absl//absl/algorithm:container",
         "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/container:inlined_vector",
+        "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/types:span",
@@ -7219,8 +7221,33 @@ cc_library(
     hdrs = ["gpu_compilation_environment.h"],
     deps = [
         ":compilation_environments",
+        "//xla:parse_flags_from_env",
+        "//xla:statusor",
+        "//xla:util",
         "//xla:xla_proto_cc",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/types:span",
         "@tsl//tsl/platform:protobuf",
+        "@tsl//tsl/platform:statusor",
+        "@tsl//tsl/util:command_line_flags",
+    ],
+)
+
+xla_cc_test(
+    name = "gpu_compilation_environment_test",
+    size = "small",
+    srcs = ["gpu_compilation_environment_test.cc"],
+    deps = [
+        ":compilation_environments",
+        ":gpu_compilation_environment",
+        "//xla:parse_flags_from_env",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest_main",
+        "@tsl//tsl/lib/core:status_test_util",
+        "@tsl//tsl/platform:env",
+        "@tsl//tsl/platform:errors",
+        "@tsl//tsl/platform:status_matchers",
+        "@tsl//tsl/platform:statusor",
     ],
 )
 
